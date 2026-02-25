@@ -9,6 +9,8 @@
  *        Query params:
  *          (none)                       → overview of all agents
  *          ?agent_id=X&repo=Y           → run history for one agent+repo
+ *          ?history=true&agent_id=X&repo=Y
+ *                                       → same as above (legacy issue contract)
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -75,8 +77,19 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const agentId = searchParams.get("agent_id");
   const repo = searchParams.get("repo");
+  const historyFlag = searchParams.get("history");
+  const wantsHistory = historyFlag === "true";
 
-  // If both agent_id and repo are provided, return per-agent history
+  // Explicit history mode from issue contract requires both selectors.
+  if (wantsHistory && (!agentId || !repo)) {
+    return agentHealthError(
+      AGENT_HEALTH_ERROR.MISSING_FIELDS,
+      "history=true requires both agent_id and repo",
+      400,
+    );
+  }
+
+  // Backward-compatible mode: agent_id+repo implies history.
   if (agentId && repo) {
     const history = await getHistory(
       auth.session.installationId,
@@ -84,7 +97,12 @@ export async function GET(request: NextRequest) {
       repo,
       auth.redis,
     );
-    return NextResponse.json({ agent_id: agentId, repo, history });
+    return NextResponse.json({
+      agent_id: agentId,
+      repo,
+      history,
+      runs: history,
+    });
   }
 
   // If only one is provided, that's a bad request

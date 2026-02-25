@@ -257,6 +257,29 @@ describe("GET /api/agent-health", () => {
     expect(body.agent_id).toBe("bee-1");
     expect(body.repo).toBe("hivemoot/sandbox");
     expect(body.history).toHaveLength(1);
+    expect(body.runs).toHaveLength(1);
+  });
+
+  it("returns history when history=true is provided", async () => {
+    vi.mocked(getHistory).mockResolvedValue([
+      {
+        agent_id: "bee-1",
+        repo: "hivemoot/sandbox",
+        status: "working",
+        received_at: "2026-02-24T10:00:00Z",
+      },
+    ]);
+
+    const res = await GET(makeGetRequest({
+      history: "true",
+      agent_id: "bee-1",
+      repo: "hivemoot/sandbox",
+    }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.history).toHaveLength(1);
+    expect(body.runs).toHaveLength(1);
   });
 
   it("returns 400 when only agent_id is provided", async () => {
@@ -269,6 +292,28 @@ describe("GET /api/agent-health", () => {
 
   it("returns 400 when only repo is provided", async () => {
     const res = await GET(makeGetRequest({ repo: "hivemoot/sandbox" }));
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.code).toBe("agent_health_missing_fields");
+  });
+
+  it("returns 400 when history=true is missing agent_id", async () => {
+    const res = await GET(makeGetRequest({
+      history: "true",
+      repo: "hivemoot/sandbox",
+    }));
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.code).toBe("agent_health_missing_fields");
+  });
+
+  it("returns 400 when history=true is missing repo", async () => {
+    const res = await GET(makeGetRequest({
+      history: "true",
+      agent_id: "bee-1",
+    }));
     expect(res.status).toBe(400);
 
     const body = await res.json();
