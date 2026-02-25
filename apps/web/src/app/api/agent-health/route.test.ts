@@ -5,6 +5,9 @@ import { NextRequest, NextResponse } from "next/server";
 // Mocks
 // ---------------------------------------------------------------------------
 
+vi.mock("@/server/byok-auth", () => ({
+  authenticateByokRequest: vi.fn(),
+}));
 vi.mock("@/server/agent-health-auth", () => ({
   authenticateAgentRequest: vi.fn(),
 }));
@@ -12,21 +15,34 @@ vi.mock("@/server/agent-health-store", () => ({
   validateReport: vi.fn(),
   checkRateLimit: vi.fn(),
   recordHealthReport: vi.fn(),
+  getOverview: vi.fn(),
+  getHistory: vi.fn(),
 }));
 
+import { authenticateByokRequest } from "@/server/byok-auth";
 import { authenticateAgentRequest } from "@/server/agent-health-auth";
 import {
   validateReport,
   checkRateLimit,
   recordHealthReport,
+  getOverview,
+  getHistory,
 } from "@/server/agent-health-store";
-import { POST } from "./route";
+import { POST, GET } from "./route";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function mockAuthSuccess(installationId = "inst-1") {
+const MOCK_SESSION = {
+  installationId: "inst-1",
+  userId: 1,
+  userLogin: "alice",
+};
+
+const MOCK_KEYRING = new Map([["v1", Buffer.alloc(32)]]);
+
+function mockAgentAuthSuccess(installationId = "inst-1") {
   vi.mocked(authenticateAgentRequest).mockResolvedValue({
     ok: true,
     installationId,
@@ -34,8 +50,25 @@ function mockAuthSuccess(installationId = "inst-1") {
   });
 }
 
-function mockAuthFailure(status: number, code: string, message: string) {
+function mockAgentAuthFailure(status: number, code: string, message: string) {
   vi.mocked(authenticateAgentRequest).mockResolvedValue({
+    ok: false,
+    response: NextResponse.json({ code, message }, { status }),
+  });
+}
+
+function mockSessionAuthSuccess() {
+  vi.mocked(authenticateByokRequest).mockResolvedValue({
+    ok: true,
+    session: MOCK_SESSION,
+    keyring: MOCK_KEYRING,
+    activeKeyVersion: "v1",
+    redis: {} as never,
+  });
+}
+
+function mockSessionAuthFailure(status: number, code: string, message: string) {
+  vi.mocked(authenticateByokRequest).mockResolvedValue({
     ok: false,
     response: NextResponse.json({ code, message }, { status }),
   });
@@ -52,6 +85,16 @@ function makePostRequest(body: unknown) {
   });
 }
 
+function makeGetRequest(params?: Record<string, string>) {
+  const url = new URL("https://example.com/api/agent-health");
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      url.searchParams.set(key, value);
+    }
+  }
+  return new NextRequest(url.toString(), { method: "GET" });
+}
+
 const VALID_REPORT = {
   agent_id: "bee-1",
   repo: "hivemoot/sandbox",
@@ -61,13 +104,16 @@ const VALID_REPORT = {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockAuthSuccess();
+  mockAgentAuthSuccess();
+  mockSessionAuthSuccess();
   vi.mocked(validateReport).mockReturnValue({
     ok: true,
     report: VALID_REPORT,
   });
   vi.mocked(checkRateLimit).mockResolvedValue(true);
   vi.mocked(recordHealthReport).mockResolvedValue(undefined);
+  vi.mocked(getOverview).mockResolvedValue([]);
+  vi.mocked(getHistory).mockResolvedValue([]);
 });
 
 // ---------------------------------------------------------------------------
@@ -103,14 +149,14 @@ describe("POST /api/agent-health", () => {
   });
 
   it("returns 401 when not authenticated", async () => {
-    mockAuthFailure(401, "agent_health_not_authenticated", "Invalid token");
+    mockAgentAuthFailure(401, "agent_health_not_authenticated", "Invalid token");
 
     const res = await POST(makePostRequest({ agent_id: "bee-1", repo: "r", status: "idle" }));
     expect(res.status).toBe(401);
   });
 
   it("returns 400 when body is not valid JSON", async () => {
-    mockAuthSuccess();
+    mockAgentAuthSuccess();
 
     const req = new NextRequest("https://example.com/api/agent-health", {
       method: "POST",
@@ -164,5 +210,80 @@ describe("POST /api/agent-health", () => {
     }));
 
     expect(recordHealthReport).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — GET
+// ---------------------------------------------------------------------------
+
+describe("GET /api/agent-health", () => {
+  it("returns overview when no query params are provided", async () => {
+    vi.mocked(getOverview).mockResolvedValue([
+      {
+        agent_id: "bee-1",
+        repo: "hivemoot/sandbox",
+        status: "idle",
+        received_at: "2026-02-24T10:00:00Z",
+        online: true,
+      },
+    ]);
+
+    const res = await GET(makeGetRequest());
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.agents).toHaveLength(1);
+    expect(body.agents[0].agent_id).toBe("bee-1");
+  });
+
+  it("returns history when agent_id and repo are provided", async () => {
+    vi.mocked(getHistory).mockResolvedValue([
+      {
+        agent_id: "bee-1",
+        repo: "hivemoot/sandbox",
+        status: "working",
+        received_at: "2026-02-24T10:00:00Z",
+      },
+    ]);
+
+    const res = await GET(makeGetRequest({
+      agent_id: "bee-1",
+      repo: "hivemoot/sandbox",
+    }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.agent_id).toBe("bee-1");
+    expect(body.repo).toBe("hivemoot/sandbox");
+    expect(body.history).toHaveLength(1);
+  });
+
+  it("returns 400 when only agent_id is provided", async () => {
+    const res = await GET(makeGetRequest({ agent_id: "bee-1" }));
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.code).toBe("agent_health_missing_fields");
+  });
+
+  it("returns 400 when only repo is provided", async () => {
+    const res = await GET(makeGetRequest({ repo: "hivemoot/sandbox" }));
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.code).toBe("agent_health_missing_fields");
+  });
+
+  it("returns auth error when session is invalid", async () => {
+    mockSessionAuthFailure(401, "byok_not_authenticated", "Not authenticated");
+
+    const res = await GET(makeGetRequest());
+    expect(res.status).toBe(401);
+  });
+
+  it("passes installationId from session to getOverview", async () => {
+    await GET(makeGetRequest());
+    expect(getOverview).toHaveBeenCalledWith("inst-1", expect.anything());
   });
 });

@@ -1,5 +1,5 @@
 /**
- * Agent health report storage.
+ * Agent health report storage and retrieval.
  *
  * Redis layout per agent:
  *
@@ -26,6 +26,7 @@ import { type Redis } from "@upstash/redis";
 const LATEST_TTL_SECONDS = 30 * 60; // 30 minutes
 const RATE_LIMIT_SECONDS = 60;
 const HISTORY_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_HISTORY_ENTRIES = 1440; // 24h at 1/min
 
 // ---------------------------------------------------------------------------
 // Types
@@ -39,6 +40,17 @@ export interface HealthReport {
   summary?: string;
   error_message?: string;
   received_at: string; // ISO 8601, server-assigned
+}
+
+export interface HealthOverviewEntry {
+  agent_id: string;
+  repo: string;
+  status: HealthReport["status"];
+  current_issue?: number;
+  summary?: string;
+  error_message?: string;
+  received_at: string;
+  online: boolean; // true if latest key still has TTL remaining
 }
 
 // ---------------------------------------------------------------------------
@@ -178,4 +190,97 @@ export async function recordHealthReport(
     "-inf",
     cutoff,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Read functions (used by GET endpoint in PR 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns an overview of all agents for an installation.
+ * One entry per agent+repo combo, with online status derived from TTL.
+ */
+export async function getOverview(
+  installId: string,
+  redis: Redis,
+): Promise<HealthOverviewEntry[]> {
+  const members = await redis.smembers(indexKey(installId));
+  if (!members || members.length === 0) return [];
+
+  const entries: HealthOverviewEntry[] = [];
+
+  for (const member of members) {
+    const separatorIdx = member.indexOf(":");
+    if (separatorIdx === -1) continue;
+
+    const agentId = member.slice(0, separatorIdx);
+    const repo = member.slice(separatorIdx + 1);
+    const key = latestKey(installId, agentId, repo);
+
+    const report = await redis.get<HealthReport>(key);
+    const ttl = await redis.ttl(key);
+    const online = ttl > 0;
+
+    if (report && typeof report.agent_id === "string") {
+      entries.push({
+        agent_id: report.agent_id,
+        repo: report.repo,
+        status: report.status,
+        current_issue: report.current_issue,
+        summary: report.summary,
+        error_message: report.error_message,
+        received_at: report.received_at,
+        online,
+      });
+    } else {
+      // Agent existed but latest key expired — show as offline
+      entries.push({
+        agent_id: agentId,
+        repo,
+        status: "idle",
+        received_at: "",
+        online: false,
+      });
+    }
+  }
+
+  // Sort by received_at descending (most recent first)
+  entries.sort((a, b) => {
+    if (!a.received_at) return 1;
+    if (!b.received_at) return -1;
+    return b.received_at.localeCompare(a.received_at);
+  });
+
+  return entries;
+}
+
+/**
+ * Returns the run history for a specific agent+repo combo.
+ * Results are sorted newest-first, limited to MAX_HISTORY_ENTRIES.
+ */
+export async function getHistory(
+  installId: string,
+  agentId: string,
+  repo: string,
+  redis: Redis,
+): Promise<HealthReport[]> {
+  const key = runsKey(installId, agentId, repo);
+
+  // Trim stale entries first
+  const now = Date.now();
+  const cutoff = now - HISTORY_RETENTION_MS;
+  await redis.zremrangebyscore(key, "-inf", cutoff);
+
+  // Fetch newest-first
+  const raw = await redis.zrange(key, 0, MAX_HISTORY_ENTRIES - 1, { rev: true });
+  if (!raw || raw.length === 0) return [];
+
+  return raw
+    .map((entry) => {
+      if (typeof entry === "string") {
+        try { return JSON.parse(entry) as HealthReport; } catch { return null; }
+      }
+      return entry as HealthReport;
+    })
+    .filter((r): r is HealthReport => r !== null);
 }

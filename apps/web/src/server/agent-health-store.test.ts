@@ -4,6 +4,8 @@ import {
   validateReport,
   checkRateLimit,
   recordHealthReport,
+  getOverview,
+  getHistory,
   type HealthReport,
 } from "./agent-health-store";
 
@@ -28,6 +30,9 @@ function makeMockRedis() {
       store.delete(key);
       return existed ? 1 : 0;
     }),
+    ttl: vi.fn(async (key: string) => {
+      return store.has(key) ? 1800 : -2;
+    }),
     sadd: vi.fn(async (key: string, ...members: string[]) => {
       if (!sets.has(key)) sets.set(key, new Set());
       const set = sets.get(key)!;
@@ -37,10 +42,22 @@ function makeMockRedis() {
       }
       return added;
     }),
+    smembers: vi.fn(async (key: string) => {
+      const set = sets.get(key);
+      return set ? [...set] : [];
+    }),
     zadd: vi.fn(async (key: string, entry: { score: number; member: string }) => {
       if (!sortedSets.has(key)) sortedSets.set(key, new Map());
       sortedSets.get(key)!.set(entry.member, entry.score);
       return 1;
+    }),
+    zrange: vi.fn(async (key: string, start: number, stop: number, opts?: { rev?: boolean }) => {
+      const zset = sortedSets.get(key);
+      if (!zset) return [];
+      const entries = [...zset.entries()].sort((a, b) =>
+        opts?.rev ? b[1] - a[1] : a[1] - b[1],
+      );
+      return entries.slice(start, stop + 1).map(([member]) => member);
     }),
     zremrangebyscore: vi.fn(async (key: string, min: string | number, max: string | number) => {
       const zset = sortedSets.get(key);
@@ -288,5 +305,123 @@ describe("recordHealthReport", () => {
       "-inf",
       cutoff,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — getOverview
+// ---------------------------------------------------------------------------
+
+describe("getOverview", () => {
+  let redis: ReturnType<typeof makeMockRedis>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    redis = makeMockRedis();
+  });
+
+  it("returns empty array when no agents are indexed", async () => {
+    const result = await getOverview("inst-1", redis);
+    expect(result).toEqual([]);
+  });
+
+  it("returns overview entries for indexed agents", async () => {
+    const report: HealthReport = {
+      agent_id: "bee-1",
+      repo: "hivemoot/sandbox",
+      status: "working",
+      current_issue: 42,
+      received_at: "2026-02-24T10:00:00Z",
+    };
+
+    // Simulate state after recordHealthReport
+    redis._sets.set("agent-health:index:inst-1", new Set(["bee-1:hivemoot/sandbox"]));
+    redis._store.set("agent-health:latest:inst-1:bee-1:hivemoot/sandbox", report);
+
+    const result = await getOverview("inst-1", redis);
+    expect(result).toHaveLength(1);
+    expect(result[0].agent_id).toBe("bee-1");
+    expect(result[0].repo).toBe("hivemoot/sandbox");
+    expect(result[0].status).toBe("working");
+    expect(result[0].current_issue).toBe(42);
+    expect(result[0].online).toBe(true);
+  });
+
+  it("marks agents as offline when latest key has expired", async () => {
+    redis._sets.set("agent-health:index:inst-1", new Set(["bee-1:hivemoot/sandbox"]));
+    // No latest key stored → expired
+    vi.mocked(redis.ttl).mockResolvedValue(-2);
+
+    const result = await getOverview("inst-1", redis);
+    expect(result).toHaveLength(1);
+    expect(result[0].online).toBe(false);
+    expect(result[0].agent_id).toBe("bee-1");
+  });
+
+  it("sorts entries by received_at descending", async () => {
+    redis._sets.set("agent-health:index:inst-1", new Set([
+      "bee-1:hivemoot/sandbox",
+      "bee-2:hivemoot/sandbox",
+    ]));
+    redis._store.set("agent-health:latest:inst-1:bee-1:hivemoot/sandbox", {
+      agent_id: "bee-1",
+      repo: "hivemoot/sandbox",
+      status: "idle",
+      received_at: "2026-02-24T09:00:00Z",
+    });
+    redis._store.set("agent-health:latest:inst-1:bee-2:hivemoot/sandbox", {
+      agent_id: "bee-2",
+      repo: "hivemoot/sandbox",
+      status: "working",
+      received_at: "2026-02-24T10:00:00Z",
+    });
+
+    const result = await getOverview("inst-1", redis);
+    expect(result[0].agent_id).toBe("bee-2"); // more recent
+    expect(result[1].agent_id).toBe("bee-1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — getHistory
+// ---------------------------------------------------------------------------
+
+describe("getHistory", () => {
+  let redis: ReturnType<typeof makeMockRedis>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    redis = makeMockRedis();
+  });
+
+  it("returns empty array when no history exists", async () => {
+    const result = await getHistory("inst-1", "bee-1", "repo", redis);
+    expect(result).toEqual([]);
+  });
+
+  it("returns parsed reports from sorted set", async () => {
+    const recentTimestamp = new Date(Date.now() - 60_000).toISOString(); // 1 min ago
+    const report: HealthReport = {
+      agent_id: "bee-1",
+      repo: "hivemoot/sandbox",
+      status: "idle",
+      received_at: recentTimestamp,
+    };
+
+    // Simulate stored sorted set data
+    const key = "agent-health:runs:inst-1:bee-1:hivemoot/sandbox";
+    redis._sortedSets.set(key, new Map([
+      [JSON.stringify(report), new Date(recentTimestamp).getTime()],
+    ]));
+
+    const result = await getHistory("inst-1", "bee-1", "hivemoot/sandbox", redis);
+    expect(result).toHaveLength(1);
+    expect(result[0].agent_id).toBe("bee-1");
+    expect(result[0].status).toBe("idle");
+  });
+
+  it("trims stale entries before returning", async () => {
+    await getHistory("inst-1", "bee-1", "repo", redis);
+    expect(redis.zremrangebyscore).toHaveBeenCalled();
   });
 });
